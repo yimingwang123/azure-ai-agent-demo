@@ -1,20 +1,15 @@
+# Azure AI Agent Service Enterprise Demo
+
+# ### Import Necessary Libraries
+# In this cell, we import all the libraries and modules required for the project.
+# This includes Azure AI SDKs, Gradio for UI, and custom functions.
+
 import os
 import re
-import signal
-import sys
 from datetime import datetime as pydatetime
 from typing import Any, List, Dict
 from dotenv import load_dotenv
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
-import uvicorn
-import threading
-import time
-from azure.core.exceptions import ResourceExistsError
-from azure.core.pipeline.policies import RetryPolicy
-from azure.core.pipeline.transport import RequestsTransport
-
+import json
 
 # (Optional) Gradio app for UI
 import gradio as gr
@@ -40,50 +35,33 @@ from azure.ai.projects.models import (
 # Your custom Python functions (for "fetch_weather","fetch_stock_price","send_email","fetch_datetime", etc.)
 from enterprise_functions import enterprise_fns
 
-load_dotenv(override=True)
+load_dotenv()
 
-# Create Client and Load Azure AI Foundry with increased timeout and retry policy
+# ### Create Client and Load Azure AI Foundry
+# Here, we initialize the Azure AI client using DefaultAzureCredential.
+# This allows us to authenticate and connect to the Azure AI service.
+
 credential = DefaultAzureCredential()
-retry_policy = RetryPolicy()
-transport = RequestsTransport(connection_timeout=600, read_timeout=600)
 project_client = AIProjectClient.from_connection_string(
     credential=credential,
-    conn_str=os.environ["PROJECT_CONNECTION_STRING"],
-    retry_policy=retry_policy,
-    transport=transport
+    conn_str=os.environ["PROJECT_CONNECTION_STRING"]
 )
 
-# Get the agent name from the environment variables
-AGENT_NAME = os.environ["AGENT_NAME"]
+# ### Set Up Tools (BingGroundingTool, FileSearchTool)
+# In this step, we configure tools such as `BingGroundingTool` and `FileSearchTool`.
+# We check for existing connections and create or reuse vector stores for document search.
 
-# Find the agent by name
-found_agent = None
-all_agents_list = project_client.agents.list_agents().data
-for a in all_agents_list:
-    if a.name == AGENT_NAME:
-        found_agent = a
-        break
-
-if not found_agent:
-    raise ValueError(f"Agent with name '{AGENT_NAME}' not found.")
-
-agent_id = found_agent.id
-print(f"Using agent > {found_agent.name} (id: {agent_id})")
-
-# Print the value of BING_CONNECTION_NAME for debugging
-print(f"BING_CONNECTION_NAME: {os.environ['BING_CONNECTION_NAME']}")
-
-# Set Up Tools (BingGroundingTool, FileSearchTool)
 try:
     bing_connection = project_client.connections.get(connection_name=os.environ["BING_CONNECTION_NAME"])
     conn_id = bing_connection.id
     bing_tool = BingGroundingTool(connection_id=conn_id)
     print("bing > connected")
-except Exception as e:
+except Exception:
     bing_tool = None
-    print(f"bing failed > no connection found or permission issue: {e}")
+    print("bing failed > no connection found or permission issue")
 
-VECTOR_STORE_NAME = os.environ["VECTOR_STORE_NAME"]
+FOLDER_NAME = "enterprise-data"
+VECTOR_STORE_NAME = "hr-policy-vector-store"
 all_vector_stores = project_client.agents.list_vector_stores().data
 existing_vector_store = next(
     (store for store in all_vector_stores if store.name == VECTOR_STORE_NAME),
@@ -94,62 +72,168 @@ vector_store_id = None
 if existing_vector_store:
     vector_store_id = existing_vector_store.id
     print(f"reusing vector store > {existing_vector_store.name} (id: {existing_vector_store.id})")
+else:
+    # If you have local docs to upload
+    import os
+    if os.path.isdir(FOLDER_NAME):
+        file_ids = []
+        for file_name in os.listdir(FOLDER_NAME):
+            file_path = os.path.join(FOLDER_NAME, file_name)
+            if os.path.isfile(file_path):
+                print(f"uploading > {file_name}")
+                uploaded_file = project_client.agents.upload_file_and_poll(
+                    file_path=file_path,
+                    purpose=FilePurpose.AGENTS
+                )
+                file_ids.append(uploaded_file.id)
+
+        if file_ids:
+            print(f"creating vector store > from {len(file_ids)} files.")
+            vector_store = project_client.agents.create_vector_store_and_poll(
+                file_ids=file_ids,
+                name=VECTOR_STORE_NAME
+            )
+            vector_store_id = vector_store.id
+            print(f"created > {vector_store.name} (id: {vector_store_id})")
 
 file_search_tool = None
 if vector_store_id:
     file_search_tool = FileSearchTool(vector_store_ids=[vector_store_id])
-    print("file search > connected")
 
-# Combine All Tools into a ToolSet
+# ### Combine All Tools into a ToolSet
+# This step creates a custom `ToolSet` that includes all the tools configured earlier.
+# It also adds a `LoggingToolSet` subclass to log the inputs and outputs of function calls.
+
 class LoggingToolSet(ToolSet):
-    def add(self, tool):
-        super().add(tool)
-        tool_name = getattr(tool, 'name', type(tool).__name__)
-        print(f"tool > added {tool_name}")
+    def execute_tool_calls(self, tool_calls: List[Any]) -> List[dict]:
+        """
+        Execute the upstream calls, printing only two lines per function:
+        1) The function name + its input arguments
+        2) The function name + its output result
+        """
+
+        # For each function call, print the input arguments
+        for c in tool_calls:
+            if hasattr(c, "function") and c.function:
+                fn_name = c.function.name
+                fn_args = c.function.arguments
+                print(f"{fn_name} inputs > {fn_args} (id:{c.id})")
+
+        # Execute the tool calls (superclass logic)
+        raw_outputs = super().execute_tool_calls(tool_calls)
+
+        # Print the output of each function call
+        for item in raw_outputs:
+            print(f"output > {item['output']}")
+
+        return raw_outputs
+
+custom_functions = FunctionTool(enterprise_fns)
 
 toolset = LoggingToolSet()
 if bing_tool:
     toolset.add(bing_tool)
 if file_search_tool:
     toolset.add(file_search_tool)
-
-custom_functions = FunctionTool(enterprise_fns)
 toolset.add(custom_functions)
 
 for tool in toolset._tools:
-    tool_name = getattr(tool, 'name', type(tool).__name__)
+    tool_name = tool.__class__.__name__
     print(f"tool > {tool_name}")
+    for definition in tool.definitions:
+        if hasattr(definition, "function"):
+            fn = definition.function
+            print(f"{fn.name} > {fn.description}")
+        else:
+            pass
 
-# Update the existing agent to use new tools
-def update_agent_with_retry(agent_id, model, instructions, toolset, retries=3, delay=5):
-    for attempt in range(retries):
-        try:
-            return project_client.agents.update_agent(
-                assistant_id=agent_id,
-                model=model,
-                instructions=instructions,
-                toolset=toolset,
-            )
-        except ResourceExistsError:
-            if attempt < retries - 1:
-                print(f"Retrying update_agent... attempt {attempt + 1}")
-                time.sleep(delay)
-            else:
-                raise
+# ### (Optional) Direct Azure AI Search Integration
+# Skip this cell if you're using the default File Search Tool vector store approach
 
-agent = update_agent_with_retry(
-    agent_id=found_agent.id,
-    model=found_agent.model,
-    instructions=found_agent.instructions,
-    toolset=toolset,
+if any(tool.__class__.__name__ == "FileSearchTool" for tool in toolset._tools):
+    print("file_search tool exists > skipping ai_search tool add")
+else:
+    try:
+        # Get the connection ID for your Azure AI Search resource
+        connections = project_client.connections.list()
+        conn_id = next(
+            c.id for c in connections if c.name == os.environ.get("AZURE_SEARCH_CONNECTION_NAME")
+        )
+
+        # Initialize Azure AI Search tool for direct index access
+        from azure.ai.projects.models import AzureAISearchTool
+        search_tool = AzureAISearchTool(
+            index_connection_id=conn_id,
+            index_name=os.environ.get("AZURE_SEARCH_INDEX_NAME")
+        )
+
+        # Add the Azure AI Search tool to our toolset
+        toolset.add(search_tool)
+        print("azure ai search > connected directly to index")
+
+        # Verify the tool was added by iterating through the toolset
+        for tool in toolset._tools:
+            tool_name = tool.__class__.__name__
+            print(f"tool > {tool_name}")
+            for definition in tool.definitions:
+                if hasattr(definition, "function"):
+                    fn = definition.function
+                    print(f"{fn.name} > {fn.description}")
+                else:
+                    pass
+
+    except Exception as e:
+        print(f"azure ai search > skipped (no connection configured): {str(e)}")
+
+# ### Create or Reuse the Enterprise Agent
+# In this step, we create a new enterprise agent or reuse an existing one.
+# The agent is configured with a model, instructions, and the toolset from the previous step.
+
+AGENT_NAME = "ai-agent-demo"
+found_agent = None
+all_agents_list = project_client.agents.list_agents().data
+for a in all_agents_list:
+    if a.name == AGENT_NAME:
+        found_agent = a
+        break
+
+model_name = os.environ.get("MODEL_DEPLOYMENT_NAME", "gpt-4o")
+instructions = (
+    "You are a helpful enterprise assistant at Microsoft. "
+    f"Today's date is {pydatetime.now().strftime('%A, %b %d, %Y, %I:%M %p')}. "
+    "You have access to hr documents in file_search, the grounding engine from bing and custom python functions like fetch_weather, "
+    "fetch_stock_price, send_email, etc. Provide well-structured, concise, and professional answers."
 )
-print(f"reusing agent > {agent.name} (id: {agent.id})")
 
-# Create a Conversation Thread
+if found_agent:
+    # Update the existing agent to use new tools
+    agent = project_client.agents.update_agent(
+        agent_id=found_agent.id,  # Changed from assistant_id to agent_id
+        model=found_agent.model,
+        instructions=found_agent.instructions,
+        toolset=toolset,
+    )
+    print(f"reusing agent > {agent.name} (id: {agent.id})")
+else:
+    agent = project_client.agents.create_agent(
+        model=model_name,
+        name=AGENT_NAME,
+        instructions=instructions,
+        toolset=toolset
+    )
+    print(f"creating agent > {agent.name} (id: {agent.id})")
+
+# ### Create a Conversation Thread
+# In this step, we create a new conversation thread for the enterprise agent.
+# Threads are used to manage and track conversations with the agent.
+
 thread = project_client.agents.create_thread()
 print(f"thread > created (id: {thread.id})")
 
-# Define a Custom Event Handler
+# ### Define a Custom Event Handler
+# Here, we define a custom event handler to manage logs and outputs for debugging.
+# This handler will capture and display real-time events during the agent's operation.
+
 class MyEventHandler(AgentEventHandler):
     def __init__(self):
         super().__init__()
@@ -162,7 +246,7 @@ class MyEventHandler(AgentEventHandler):
             # First, if we had an old message that wasn't completed, finish that line
             if self._current_message_id is not None:
                 print()  # move to a new line
-            
+
             self._current_message_id = delta.id
             self._accumulated_text = ""
             print("\nassistant > ", end="")  # prefix for new message
@@ -212,7 +296,10 @@ class MyEventHandler(AgentEventHandler):
     def on_done(self) -> None:
         print("done")
 
-# Implement the Main Chat Functions
+# ### Implement the Main Chat Functions
+# These functions define how user messages and tool interactions are processed.
+# It uses the agent's thread to handle conversations and streams partial responses.
+
 def extract_bing_query(request_url: str) -> str:
     """
     Extract the query string from something like:
@@ -246,6 +333,7 @@ def azure_enterprise_chat(user_message: str, history: List[dict]):
     This function returns a list of ChatMessage objects directly (no dict conversion).
     Your Gradio Chatbot should be type="messages" to handle them properly.
     """
+
     # Convert existing history from dict to ChatMessage
     conversation = []
     for msg_dict in history:
@@ -407,8 +495,8 @@ def azure_enterprise_chat(user_message: str, history: List[dict]):
     # -- EVENT STREAMING --
     with project_client.agents.create_stream(
         thread_id=thread.id,
-        assistant_id=agent_id,
-        event_handler=MyEventHandler()  # the event handler handles console output
+        agent_id=agent.id,
+        event_handler=MyEventHandler()
     ) as stream:
         for item in stream:
             event_type, event_data, *_ = item
@@ -444,10 +532,20 @@ def azure_enterprise_chat(user_message: str, history: List[dict]):
                     call_id_for_index.clear()
                     yield conversation, ""
 
+                # elif step_type == "message_creation" and step_status == "in_progress":
+                #     msg_id = event_data["step_details"]["message_creation"].get("message_id")
+                #     if msg_id:
+                #         conversation.append(ChatMessage(role="assistant", content=""))
+                #     yield conversation, ""
+
                 elif step_type == "message_creation" and step_status == "in_progress":
                     msg_id = event_data["step_details"]["message_creation"].get("message_id")
                     if msg_id:
-                        conversation.append(ChatMessage(role="assistant", content=""))
+                        conversation.append(ChatMessage(
+                            role="assistant",
+                            content="",
+                            metadata={"id": msg_id}
+                        ))
                     yield conversation, ""
 
                 elif step_type == "message_creation" and step_status == "completed":
@@ -509,31 +607,56 @@ def azure_enterprise_chat(user_message: str, history: List[dict]):
                 yield conversation, ""
                 break
 
+            # After detecting "requires_action" status
+            elif event_type == "thread.run" and event_data["status"] == "requires_action":
+                run_id = event_data["id"]
+                # 1. Get the required action details
+                tool_calls = event_data["required_action"]["submit_tool_outputs"]["tool_calls"]
+                outputs = []
+                
+                # 2. Execute each requested tool call using your toolset directly
+                for tool_call in tool_calls:
+                    function_name = tool_call["function"]["name"]
+                    arguments = json.loads(tool_call["function"]["arguments"])
+                    
+                    # Execute the tool call with your existing toolset
+                    tool_outputs = toolset.execute_tool_calls([{
+                        "id": tool_call["id"],
+                        "function": {
+                            "name": function_name,
+                            "arguments": tool_call["function"]["arguments"]
+                        }
+                    }])
+                    
+                    # Add the result to outputs
+                    for output in tool_outputs:
+                        outputs.append({
+                            "tool_call_id": output["tool_call_id"],
+                            "output": output["output"]
+                        })
+                
+                # 3. Submit the results back
+                project_client.agents.submit_tool_outputs(
+                    thread_id=thread.id,
+                    run_id=run_id,
+                    tool_outputs=outputs
+                )
+                
+                # 4. Create a NEW run to continue the conversation after tool outputs
+                new_run = project_client.agents.create_run(
+                    thread_id=thread.id,
+                    agent_id=agent.id
+                )
+                
+                # Continue processing events
+                yield conversation, ""
+
     return conversation, ""
 
-# Initialize FastAPI app
-import sys
-import threading
-import signal
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
-import gradio as gr
-import uvicorn
+# ### Build a Gradio UI
+# Create a Gradio interface for interacting with the enterprise agent.
+# Include a chatbot component and a text input box for user queries.
 
-# Initialize FastAPI app
-app = FastAPI()
-
-# Allow CORS for all origins
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# Define the Gradio interface
 brand_theme = gr.themes.Default(
     primary_hue="blue",
     secondary_hue="blue",
@@ -572,7 +695,7 @@ with gr.Blocks(theme=brand_theme, css="footer {visibility: hidden;}", fill_heigh
     def on_example_clicked(evt: gr.SelectData):
         return evt.value["text"]  # Fill the textbox with that example text
 
-    gr.HTML("<h1 style='text-align: center;'>Azure AI Agent Service</h1>")
+    gr.HTML("<h1 style=\"text-align: center;\">Azure AI Agent Service</h1>")
 
     chatbot = gr.Chatbot(
         type="messages",
@@ -596,27 +719,46 @@ with gr.Blocks(theme=brand_theme, css="footer {visibility: hidden;}", fill_heigh
     chatbot.example_select(fn=on_example_clicked, inputs=None, outputs=textbox)
 
     # On submit: call azure_enterprise_chat, then clear the textbox
-    (textbox
-     .submit(
-         fn=azure_enterprise_chat,
-         inputs=[textbox, chatbot],
-         outputs=[chatbot, textbox],
-     )
-     .then(
-         fn=lambda: "",
-         outputs=textbox,
-     )
+    (
+        textbox
+        .submit(
+            fn=azure_enterprise_chat,
+            inputs=[textbox, chatbot],
+            outputs=[chatbot, textbox],
+        )
+        .then(
+            fn=lambda: "",
+            outputs=textbox,
+        )
     )
 
     # A "Clear" button that resets the thread and the Chatbot
     chatbot.clear(fn=clear_thread, outputs=chatbot)
 
-# ✅ Correctly mount Gradio inside FastAPI
-app = gr.mount_gradio_app(app, demo, path="/")
+# Launch your Gradio app
+if __name__ == "__main__":
+    demo.launch()
 
-# ✅ Signal handler for graceful shutdown (without sys.exit)
-def signal_handler(sig, frame):
-    print("Shutting down gracefully...")
-    raise SystemExit(0)
+# ### (Optional) delete agent, thread, and vector store resources
+# Uncomment out the next block to delete the resources created in this notebook.
 
-signal.signal(signal.SIGINT, signal_handler)
+# from azure.identity import DefaultAzureCredential
+# from azure.ai.projects import AIProjectClient
+# import os
+#
+# credential = DefaultAzureCredential()
+# project_client_delete = AIProjectClient.from_connection_string(
+#     credential=credential,
+#     conn_str=os.environ.get("PROJECT_CONNECTION_STRING")
+# )
+#
+# try:
+#     project_client_delete.agents.delete_agent(agent.id)
+#     print("Agent deletion successful.")
+#     project_client_delete.agents.delete_thread(thread.id)
+#     print("Thread deletion successful.")
+#     project_client_delete.agents.delete_vector_store(vector_store_id)
+#     print("Vector store deletion successful.")
+#     print("All deletions succeeded.")
+# except Exception as e:
+#     print(f"Error during deletion: {e}")

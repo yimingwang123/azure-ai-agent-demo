@@ -1,22 +1,12 @@
+# azure_enterprise_chat_demo.py
+
 import os
 import re
-import signal
-import sys
+import json
 from datetime import datetime as pydatetime
 from typing import Any, List, Dict
 from dotenv import load_dotenv
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
-import uvicorn
-import threading
-import time
-from azure.core.exceptions import ResourceExistsError
-from azure.core.pipeline.policies import RetryPolicy
-from azure.core.pipeline.transport import RequestsTransport
 
-
-# (Optional) Gradio app for UI
 import gradio as gr
 from gradio import ChatMessage
 
@@ -37,53 +27,31 @@ from azure.ai.projects.models import (
     ToolSet
 )
 
-# Your custom Python functions (for "fetch_weather","fetch_stock_price","send_email","fetch_datetime", etc.)
+# (Your custom functions in enterprise_functions.py)
 from enterprise_functions import enterprise_fns
 
-load_dotenv(override=True)
+load_dotenv()
 
-# Create Client and Load Azure AI Foundry with increased timeout and retry policy
+# 1) Create a credential/client
 credential = DefaultAzureCredential()
-retry_policy = RetryPolicy()
-transport = RequestsTransport(connection_timeout=600, read_timeout=600)
 project_client = AIProjectClient.from_connection_string(
     credential=credential,
-    conn_str=os.environ["PROJECT_CONNECTION_STRING"],
-    retry_policy=retry_policy,
-    transport=transport
+    conn_str=os.environ["PROJECT_CONNECTION_STRING"]
 )
 
-# Get the agent name from the environment variables
-AGENT_NAME = os.environ["AGENT_NAME"]
-
-# Find the agent by name
-found_agent = None
-all_agents_list = project_client.agents.list_agents().data
-for a in all_agents_list:
-    if a.name == AGENT_NAME:
-        found_agent = a
-        break
-
-if not found_agent:
-    raise ValueError(f"Agent with name '{AGENT_NAME}' not found.")
-
-agent_id = found_agent.id
-print(f"Using agent > {found_agent.name} (id: {agent_id})")
-
-# Print the value of BING_CONNECTION_NAME for debugging
-print(f"BING_CONNECTION_NAME: {os.environ['BING_CONNECTION_NAME']}")
-
-# Set Up Tools (BingGroundingTool, FileSearchTool)
+# 2) Optionally set up Bing grounding
 try:
     bing_connection = project_client.connections.get(connection_name=os.environ["BING_CONNECTION_NAME"])
     conn_id = bing_connection.id
     bing_tool = BingGroundingTool(connection_id=conn_id)
     print("bing > connected")
-except Exception as e:
+except Exception:
     bing_tool = None
-    print(f"bing failed > no connection found or permission issue: {e}")
+    print("bing failed > no connection found or permission issue")
 
-VECTOR_STORE_NAME = os.environ["VECTOR_STORE_NAME"]
+# 3) Optionally set up local doc search
+FOLDER_NAME = "enterprise-data"
+VECTOR_STORE_NAME = "hr-policy-vector-store"
 all_vector_stores = project_client.agents.list_vector_stores().data
 existing_vector_store = next(
     (store for store in all_vector_stores if store.name == VECTOR_STORE_NAME),
@@ -94,62 +62,104 @@ vector_store_id = None
 if existing_vector_store:
     vector_store_id = existing_vector_store.id
     print(f"reusing vector store > {existing_vector_store.name} (id: {existing_vector_store.id})")
+else:
+    import os
+    if os.path.isdir(FOLDER_NAME):
+        file_ids = []
+        for file_name in os.listdir(FOLDER_NAME):
+            file_path = os.path.join(FOLDER_NAME, file_name)
+            if os.path.isfile(file_path):
+                print(f"uploading > {file_name}")
+                uploaded_file = project_client.agents.upload_file_and_poll(
+                    file_path=file_path,
+                    purpose=FilePurpose.AGENTS
+                )
+                file_ids.append(uploaded_file.id)
+
+        if file_ids:
+            print(f"creating vector store > from {len(file_ids)} files.")
+            vector_store = project_client.agents.create_vector_store_and_poll(
+                file_ids=file_ids,
+                name=VECTOR_STORE_NAME
+            )
+            vector_store_id = vector_store.id
+            print(f"created > {vector_store.name} (id: {vector_store_id})")
 
 file_search_tool = None
 if vector_store_id:
     file_search_tool = FileSearchTool(vector_store_ids=[vector_store_id])
-    print("file search > connected")
 
-# Combine All Tools into a ToolSet
+# 4) Create a LoggingToolSet that prints each function call
 class LoggingToolSet(ToolSet):
-    def add(self, tool):
-        super().add(tool)
-        tool_name = getattr(tool, 'name', type(tool).__name__)
-        print(f"tool > added {tool_name}")
+    def execute_tool_calls(self, tool_calls: List[Any]) -> List[dict]:
+        """
+        1) Print the name/arguments of each function call.
+        2) Execute them using the parent ToolSet logic.
+        3) Print the results.
+        """
+        for c in tool_calls:
+            if hasattr(c, "function") and c.function:
+                fn_name = c.function.name
+                fn_args = c.function.arguments
+                print(f"{fn_name} inputs > {fn_args} (id:{c.id})")
+
+        raw_outputs = super().execute_tool_calls(tool_calls)
+
+        for item in raw_outputs:
+            print(f"output > {item['output']}")
+
+        return raw_outputs
+
+custom_functions = FunctionTool(enterprise_fns)
 
 toolset = LoggingToolSet()
 if bing_tool:
     toolset.add(bing_tool)
 if file_search_tool:
     toolset.add(file_search_tool)
-
-custom_functions = FunctionTool(enterprise_fns)
 toolset.add(custom_functions)
 
-for tool in toolset._tools:
-    tool_name = getattr(tool, 'name', type(tool).__name__)
-    print(f"tool > {tool_name}")
+# 5) Create or reuse the agent
+AGENT_NAME = "my-enterprise-agent-demo"
+found_agent = None
+all_agents_list = project_client.agents.list_agents().data
+for a in all_agents_list:
+    if a.name == AGENT_NAME:
+        found_agent = a
+        break
 
-# Update the existing agent to use new tools
-def update_agent_with_retry(agent_id, model, instructions, toolset, retries=3, delay=5):
-    for attempt in range(retries):
-        try:
-            return project_client.agents.update_agent(
-                assistant_id=agent_id,
-                model=model,
-                instructions=instructions,
-                toolset=toolset,
-            )
-        except ResourceExistsError:
-            if attempt < retries - 1:
-                print(f"Retrying update_agent... attempt {attempt + 1}")
-                time.sleep(delay)
-            else:
-                raise
-
-agent = update_agent_with_retry(
-    agent_id=found_agent.id,
-    model=found_agent.model,
-    instructions=found_agent.instructions,
-    toolset=toolset,
+model_name = os.environ.get("MODEL_DEPLOYMENT_NAME", "gpt-4o")
+instructions = (
+    "You are a helpful enterprise assistant at Microsoft. "
+    f"Today's date is {pydatetime.now().strftime('%A, %b %d, %Y, %I:%M %p')}. "
+    "You have access to hr documents in file_search, the grounding engine from bing and custom python functions like "
+    "fetch_weather, fetch_stock_price, send_email, etc. Provide well-structured, concise, professional answers. "
+    "When you call a function like 'send_email', you must respond to the user with an appropriate success message "
+    "(e.g., 'Email sent successfully!') so that they know the function was executed. "
 )
-print(f"reusing agent > {agent.name} (id: {agent.id})")
 
-# Create a Conversation Thread
+if found_agent:
+    agent = project_client.agents.update_agent(
+        agent_id=found_agent.id,
+        model=found_agent.model,
+        instructions=found_agent.instructions,
+        toolset=toolset
+    )
+    print(f"reusing agent > {agent.name} (id: {agent.id})")
+else:
+    agent = project_client.agents.create_agent(
+        model=model_name,
+        name=AGENT_NAME,
+        instructions=instructions,
+        toolset=toolset
+    )
+    print(f"created agent > {agent.name} (id: {agent.id})")
+
+# 6) Create a new thread
 thread = project_client.agents.create_thread()
 print(f"thread > created (id: {thread.id})")
 
-# Define a Custom Event Handler
+# 7) Event Handler for debugging
 class MyEventHandler(AgentEventHandler):
     def __init__(self):
         super().__init__()
@@ -157,34 +167,28 @@ class MyEventHandler(AgentEventHandler):
         self._accumulated_text = ""
 
     def on_message_delta(self, delta: MessageDeltaChunk) -> None:
-        # If a new message id, start fresh
         if delta.id != self._current_message_id:
-            # First, if we had an old message that wasn't completed, finish that line
             if self._current_message_id is not None:
-                print()  # move to a new line
-            
+                print()  # finish the old line
             self._current_message_id = delta.id
             self._accumulated_text = ""
-            print("\nassistant > ", end="")  # prefix for new message
+            print("\nassistant > ", end="")
 
-        # Accumulate partial text
         partial_text = ""
         if delta.delta.content:
             for chunk in delta.delta.content:
                 partial_text += chunk.text.get("value", "")
         self._accumulated_text += partial_text
 
-        # Print partial text with no newline
         print(partial_text, end="", flush=True)
 
     def on_thread_message(self, message: ThreadMessage) -> None:
-        # When the assistant's entire message is "completed", print a final newline
+        # If the message is completed assistant text, put a newline
         if message.status == "completed" and message.role == "assistant":
-            print()  # done with this line
+            print()
             self._current_message_id = None
             self._accumulated_text = ""
         else:
-            # For other roles or statuses, you can log if you like:
             print(f"{message.status.name.lower()} (id: {message.id})")
 
     def on_thread_run(self, run: ThreadRun) -> None:
@@ -196,12 +200,10 @@ class MyEventHandler(AgentEventHandler):
         print(f"{step.type.name.lower()} > {step.status.name.lower()}")
 
     def on_run_step_delta(self, delta: RunStepDeltaChunk) -> None:
-        # If partial tool calls come in, we log them
         if delta.delta.step_details and delta.delta.step_details.tool_calls:
             for tcall in delta.delta.step_details.tool_calls:
-                if getattr(tcall, "function", None):
-                    if tcall.function.name is not None:
-                        print(f"tool call > {tcall.function.name}")
+                if getattr(tcall, "function", None) and tcall.function.name:
+                    print(f"tool call > {tcall.function.name}")
 
     def on_unhandled_event(self, event_type: str, event_data):
         print(f"unhandled > {event_type} > {event_data}")
@@ -212,65 +214,49 @@ class MyEventHandler(AgentEventHandler):
     def on_done(self) -> None:
         print("done")
 
-# Implement the Main Chat Functions
+# 8) Helper functions
 def extract_bing_query(request_url: str) -> str:
-    """
-    Extract the query string from something like:
-      https://api.bing.microsoft.com/v7.0/search?q="latest news about Microsoft January 2025"
-    Returns: latest news about Microsoft January 2025
-    """
     match = re.search(r'q="([^"]+)"', request_url)
     if match:
         return match.group(1)
-    # If no match, fall back to entire request_url
     return request_url
 
 def convert_dict_to_chatmessage(msg: dict) -> ChatMessage:
-    """
-    Convert a legacy dict-based message to a gr.ChatMessage.
-    Uses the 'metadata' sub-dict if present.
-    """
     return ChatMessage(
         role=msg["role"],
         content=msg["content"],
         metadata=msg.get("metadata", None)
     )
 
+# 9) The main chat function
 def azure_enterprise_chat(user_message: str, history: List[dict]):
     """
-    Accumulates partial function arguments into ChatMessage['content'], sets the
-    corresponding tool bubble status from "pending" to "done" on completion,
-    and also handles non-function calls like bing_grounding or file_search by appending a
-    "pending" bubble. Then it moves them to "done" once tool calls complete.
-
-    This function returns a list of ChatMessage objects directly (no dict conversion).
-    Your Gradio Chatbot should be type="messages" to handle them properly.
+    A single-run approach: all function calls happen inline (like Bing).
+    We do *not* create a second run or do a 'requires_action' block.
     """
-    # Convert existing history from dict to ChatMessage
+
+    # Convert existing messages from dict to ChatMessage
     conversation = []
     for msg_dict in history:
         conversation.append(convert_dict_to_chatmessage(msg_dict))
 
-    # Append the user's new message
+    # Add user's new message to conversation
     conversation.append(ChatMessage(role="user", content=user_message))
-
-    # Immediately yield two outputs to clear the textbox
     yield conversation, ""
 
-    # Post user message to the thread (for your back-end logic)
+    # Post user message
     project_client.agents.create_message(
         thread_id=thread.id,
         role="user",
         content=user_message
     )
 
-    # Mappings for partial function calls
+    # For partial function call data
     call_id_for_index: Dict[int, str] = {}
     partial_calls_by_index: Dict[int, dict] = {}
     partial_calls_by_id: Dict[str, dict] = {}
     in_progress_tools: Dict[str, ChatMessage] = {}
 
-    # Titles for tool bubbles
     function_titles = {
         "fetch_weather": "☁️ fetching weather",
         "fetch_datetime": "🕒 fetching datetime",
@@ -284,14 +270,16 @@ def azure_enterprise_chat(user_message: str, history: List[dict]):
         return function_titles.get(fn_name, f"🛠 calling {fn_name}")
 
     def accumulate_args(storage: dict, name_chunk: str, arg_chunk: str):
-        """Accumulates partial JSON data for a function call."""
         if name_chunk:
             storage["name"] += name_chunk
         if arg_chunk:
             storage["args"] += arg_chunk
 
     def finalize_tool_call(call_id: str):
-        """Creates or updates the ChatMessage bubble for a function call."""
+        """
+        Creates or updates a ChatMessage bubble for a function call.
+        (So the user sees a 'pending' bubble like "Calling fetch_weather".)
+        """
         if call_id not in partial_calls_by_id:
             return
         data = partial_calls_by_id[call_id]
@@ -301,7 +289,6 @@ def azure_enterprise_chat(user_message: str, history: List[dict]):
             return
 
         if call_id not in in_progress_tools:
-            # Create a new bubble with status="pending"
             msg_obj = ChatMessage(
                 role="assistant",
                 content=fn_args or "",
@@ -314,30 +301,25 @@ def azure_enterprise_chat(user_message: str, history: List[dict]):
             conversation.append(msg_obj)
             in_progress_tools[call_id] = msg_obj
         else:
-            # Update existing bubble
             msg_obj = in_progress_tools[call_id]
             msg_obj.content = fn_args or ""
             msg_obj.metadata["title"] = get_function_title(fn_name)
 
     def upsert_tool_call(tcall: dict):
         """
-        1) Check the call type
-        2) If "function", gather partial name/args
-        3) If "bing_grounding" or "file_search", show a pending bubble
+        Insert or update a pending bubble for each partial or complete function call.
         """
         t_type = tcall.get("type", "")
-        call_id = tcall.get("id")
+        call_id = tcall.get("id", "")
 
-        # --- BING GROUNDING ---
+        # BING GROUNDING
         if t_type == "bing_grounding":
             request_url = tcall.get("bing_grounding", {}).get("requesturl", "")
             if not request_url.strip():
                 return
-
             query_str = extract_bing_query(request_url)
             if not query_str.strip():
                 return
-
             msg_obj = ChatMessage(
                 role="assistant",
                 content=query_str,
@@ -352,7 +334,7 @@ def azure_enterprise_chat(user_message: str, history: List[dict]):
                 in_progress_tools[call_id] = msg_obj
             return
 
-        # --- FILE SEARCH ---
+        # FILE SEARCH
         elif t_type == "file_search":
             msg_obj = ChatMessage(
                 role="assistant",
@@ -368,52 +350,49 @@ def azure_enterprise_chat(user_message: str, history: List[dict]):
                 in_progress_tools[call_id] = msg_obj
             return
 
-        # --- NON-FUNCTION CALLS ---
+        # If not function, ignore
         elif t_type != "function":
             return
 
-        # --- FUNCTION CALL PARTIAL-ARGS ---
+        # FUNCTION CALL PARTIALS
         index = tcall.get("index")
         new_call_id = call_id
         fn_data = tcall.get("function", {})
         name_chunk = fn_data.get("name", "")
         arg_chunk = fn_data.get("arguments", "")
 
+        # Assign a call_id for that index
         if new_call_id:
             call_id_for_index[index] = new_call_id
 
         call_id = call_id_for_index.get(index)
         if not call_id:
-            # Accumulate partial
             if index not in partial_calls_by_index:
                 partial_calls_by_index[index] = {"name": "", "args": ""}
             accumulate_args(partial_calls_by_index[index], name_chunk, arg_chunk)
             return
 
+        # Accumulate partial data
         if call_id not in partial_calls_by_id:
             partial_calls_by_id[call_id] = {"name": "", "args": ""}
-
         if index in partial_calls_by_index:
             old_data = partial_calls_by_index.pop(index)
             partial_calls_by_id[call_id]["name"] += old_data.get("name", "")
             partial_calls_by_id[call_id]["args"] += old_data.get("args", "")
 
-        # Accumulate partial
         accumulate_args(partial_calls_by_id[call_id], name_chunk, arg_chunk)
-
-        # Create/update the function bubble
         finalize_tool_call(call_id)
 
-    # -- EVENT STREAMING --
+    # Use a single-run approach
     with project_client.agents.create_stream(
         thread_id=thread.id,
-        assistant_id=agent_id,
-        event_handler=MyEventHandler()  # the event handler handles console output
+        agent_id=agent.id,
+        event_handler=MyEventHandler()  # For console debugging
     ) as stream:
         for item in stream:
             event_type, event_data, *_ = item
 
-            # Remove any None items that might have been appended
+            # Filter out None
             conversation = [m for m in conversation if m is not None]
 
             # 1) Partial tool calls
@@ -429,25 +408,66 @@ def azure_enterprise_chat(user_message: str, history: List[dict]):
                 step_type = event_data["type"]
                 step_status = event_data["status"]
 
-                # If tool calls are in progress, new or partial
+                # In-progress tool calls
                 if step_type == "tool_calls" and step_status == "in_progress":
                     for tcall in event_data["step_details"].get("tool_calls", []):
                         upsert_tool_call(tcall)
                     yield conversation, ""
 
+                # Once all function calls are completed, we actually run them
                 elif step_type == "tool_calls" and step_status == "completed":
+                    # Mark the tool call bubbles as "done"
                     for cid, msg_obj in in_progress_tools.items():
                         msg_obj.metadata["status"] = "done"
+
+                    # Actually execute each function call
+                    # partial_calls_by_id = { call_id: {"name":"fetch_weather", "args":'{...}'} }
+                    for cid, data in partial_calls_by_id.items():
+                        fn_name = data["name"].strip()
+                        fn_args_str = data["args"].strip()
+
+                        # Attempt to parse the JSON arguments
+                        try:
+                            fn_args = json.loads(fn_args_str) if fn_args_str else {}
+                        except:
+                            fn_args = {}
+
+                        # Do the actual function call
+                        tool_result = toolset.execute_tool_calls([{
+                            "id": cid,
+                            "function": {
+                                "name": fn_name,
+                                "arguments": fn_args_str
+                            }
+                        }])
+
+                        # We can just show a short bubble "I have done what you want" + the actual output
+                        for r in tool_result:
+                            conversation.append(ChatMessage(
+                                role="assistant",
+                                content=(
+                                    f"I have done what you want (function: {fn_name}).\n"
+                                    f"Result: {r['output']}"
+                                )
+                            ))
+
+                    # Clear the partials
                     in_progress_tools.clear()
                     partial_calls_by_id.clear()
                     partial_calls_by_index.clear()
                     call_id_for_index.clear()
+
                     yield conversation, ""
 
+                # If a new assistant message is created, add a bubble
                 elif step_type == "message_creation" and step_status == "in_progress":
                     msg_id = event_data["step_details"]["message_creation"].get("message_id")
                     if msg_id:
-                        conversation.append(ChatMessage(role="assistant", content=""))
+                        conversation.append(ChatMessage(
+                            role="assistant",
+                            content="",
+                            metadata={"id": msg_id}
+                        ))
                     yield conversation, ""
 
                 elif step_type == "message_creation" and step_status == "completed":
@@ -460,19 +480,20 @@ def azure_enterprise_chat(user_message: str, history: List[dict]):
                     agent_msg += chunk["text"].get("value", "")
 
                 message_id = event_data["id"]
-
-                # Try to find a matching assistant bubble
                 matching_msg = None
                 for msg in reversed(conversation):
-                    if msg.metadata and msg.metadata.get("id") == message_id and msg.role == "assistant":
+                    if (
+                        msg.metadata
+                        and msg.metadata.get("id") == message_id
+                        and msg.role == "assistant"
+                    ):
                         matching_msg = msg
                         break
 
                 if matching_msg:
-                    # Append newly streamed text
                     matching_msg.content += agent_msg
                 else:
-                    # Append to last assistant or create new
+                    # if the last bubble is not an assistant or is a "tool-xxx" bubble
                     if (
                         not conversation
                         or conversation[-1].role != "assistant"
@@ -490,6 +511,7 @@ def azure_enterprise_chat(user_message: str, history: List[dict]):
             # 4) If entire assistant message is completed
             elif event_type == "thread.message":
                 if event_data["role"] == "assistant" and event_data["status"] == "completed":
+                    # Mark any in-progress tool calls as done
                     for cid, msg_obj in in_progress_tools.items():
                         msg_obj.metadata["status"] = "done"
                     in_progress_tools.clear()
@@ -500,6 +522,7 @@ def azure_enterprise_chat(user_message: str, history: List[dict]):
 
             # 5) Final done
             elif event_type == "thread.message.completed":
+                # Mark all tool calls done
                 for cid, msg_obj in in_progress_tools.items():
                     msg_obj.metadata["status"] = "done"
                 in_progress_tools.clear()
@@ -511,29 +534,7 @@ def azure_enterprise_chat(user_message: str, history: List[dict]):
 
     return conversation, ""
 
-# Initialize FastAPI app
-import sys
-import threading
-import signal
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
-import gradio as gr
-import uvicorn
-
-# Initialize FastAPI app
-app = FastAPI()
-
-# Allow CORS for all origins
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# Define the Gradio interface
+# 10) Build the Gradio UI
 brand_theme = gr.themes.Default(
     primary_hue="blue",
     secondary_hue="blue",
@@ -570,9 +571,9 @@ with gr.Blocks(theme=brand_theme, css="footer {visibility: hidden;}", fill_heigh
         return []
 
     def on_example_clicked(evt: gr.SelectData):
-        return evt.value["text"]  # Fill the textbox with that example text
+        return evt.value["text"]
 
-    gr.HTML("<h1 style='text-align: center;'>Azure AI Agent Service</h1>")
+    gr.HTML("<h1 style=\"text-align: center;\">Azure AI Agent Service</h1>")
 
     chatbot = gr.Chatbot(
         type="messages",
@@ -580,7 +581,7 @@ with gr.Blocks(theme=brand_theme, css="footer {visibility: hidden;}", fill_heigh
             {"text": "What's my company's remote work policy?"},
             {"text": "Check if it will rain tomorrow?"},
             {"text": "How is Microsoft's stock doing today?"},
-            {"text": "Send my direct report a summary of the HR policy."},
+            {"text": "Send my direct report an email about the new HR policy."},
         ],
         show_label=False,
         scale=1,
@@ -592,10 +593,9 @@ with gr.Blocks(theme=brand_theme, css="footer {visibility: hidden;}", fill_heigh
         submit_btn=True,
     )
 
-    # Populate textbox when an example is clicked
     chatbot.example_select(fn=on_example_clicked, inputs=None, outputs=textbox)
 
-    # On submit: call azure_enterprise_chat, then clear the textbox
+    # On submit:
     (textbox
      .submit(
          fn=azure_enterprise_chat,
@@ -608,15 +608,7 @@ with gr.Blocks(theme=brand_theme, css="footer {visibility: hidden;}", fill_heigh
      )
     )
 
-    # A "Clear" button that resets the thread and the Chatbot
     chatbot.clear(fn=clear_thread, outputs=chatbot)
 
-# ✅ Correctly mount Gradio inside FastAPI
-app = gr.mount_gradio_app(app, demo, path="/")
-
-# ✅ Signal handler for graceful shutdown (without sys.exit)
-def signal_handler(sig, frame):
-    print("Shutting down gracefully...")
-    raise SystemExit(0)
-
-signal.signal(signal.SIGINT, signal_handler)
+if __name__ == "__main__":
+    demo.launch()

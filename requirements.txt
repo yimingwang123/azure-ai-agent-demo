@@ -9,3 +9,14 @@ Pillow
 python-dotenv
 requests
 yfinance
+markdownify
+markdown
+azure-core
+azure-identity
+azure-search-documents==11.6.0b10
+azure-storage-blob==12.23.1
+dotenv
+rich
+streamlit
+numpy
+langchain-openai
